@@ -51,6 +51,8 @@ pub enum InputFormat {
     #[default]
     StreamBase64,
     StreamFramed,
+    #[value(alias = "stream-base64-separate", alias = "separate-base64")]
+    StreamSeparateBase64,
 }
 
 #[derive(Default, Clone, Copy, Debug, Eq, Hash, PartialEq, ValueEnum)]
@@ -102,6 +104,35 @@ macro_rules! run_x {
                             self.out(&t?)?;
                         }
                     }
+                    InputFormat::StreamSeparateBase64 => {
+                        let tokens = util::SeparateBase64Tokens::new(f);
+                        let mut buffered_token = String::new();
+                        for token in tokens {
+                            let token = token.map_err(Error::ReadFile)?;
+                            if buffered_token.is_empty() {
+                                buffered_token = token;
+                            } else {
+                                buffered_token.push_str(&token);
+                            }
+                            let mut cursor = std::io::Cursor::new(buffered_token.as_bytes());
+                            let mut l = crate::Limited::new(&mut cursor, crate::Limits::none());
+                            match crate::Type::read_xdr_base64_to_end(r#type, &mut l) {
+                                Ok(t) => {
+                                    self.out(&t)?;
+                                    buffered_token.clear();
+                                }
+                                Err(_) => {
+                                    continue;
+                                }
+                            }
+                        }
+                        if !buffered_token.is_empty() {
+                            let mut cursor = std::io::Cursor::new(buffered_token.as_bytes());
+                            let mut l = crate::Limited::new(&mut cursor, crate::Limits::none());
+                            let t = crate::Type::read_xdr_base64_to_end(r#type, &mut l)?;
+                            self.out(&t)?;
+                        }
+                    }
                 };
             }
             Ok(())
@@ -139,5 +170,54 @@ impl Cmd {
         };
         writeln!(stdout(), "{text}").map_err(Error::WriteOutput)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_stream_separate_base64_multiple_entities() {
+        let cmd = Cmd {
+            input: vec![OsString::from("AAAABAAAAAE=\nAAAABAAAAAI=\n")],
+            r#type: "ScVal".to_string(),
+            input_format: InputFormat::StreamSeparateBase64,
+            output_format: OutputFormat::Json,
+        };
+        assert!(cmd.run().is_ok());
+    }
+
+    #[test]
+    fn test_decode_stream_separate_base64_tightly_packed() {
+        let cmd = Cmd {
+            input: vec![OsString::from("AAAABAAAAAE=AAAABAAAAAI=")],
+            r#type: "ScVal".to_string(),
+            input_format: InputFormat::StreamSeparateBase64,
+            output_format: OutputFormat::Json,
+        };
+        assert!(cmd.run().is_ok());
+    }
+
+    #[test]
+    fn test_decode_stream_separate_base64_spaces() {
+        let cmd = Cmd {
+            input: vec![OsString::from("AAAABAAAAAE= AAAABAAAAAI=")],
+            r#type: "ScVal".to_string(),
+            input_format: InputFormat::StreamSeparateBase64,
+            output_format: OutputFormat::Json,
+        };
+        assert!(cmd.run().is_ok());
+    }
+
+    #[test]
+    fn test_decode_stream_separate_base64_invalid() {
+        let cmd = Cmd {
+            input: vec![OsString::from("not_a_valid_base64_string!!!!")],
+            r#type: "ScVal".to_string(),
+            input_format: InputFormat::StreamSeparateBase64,
+            output_format: OutputFormat::Json,
+        };
+        assert!(cmd.run().is_err());
     }
 }

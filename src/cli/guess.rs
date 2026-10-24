@@ -5,6 +5,8 @@ use std::fs::File;
 use std::io::{self, stdin, stdout, Cursor, Read, Write};
 use std::path::Path;
 
+use crate::cli::util;
+
 #[derive(thiserror::Error, Debug)]
 #[allow(clippy::enum_variant_names)]
 pub enum Error {
@@ -44,6 +46,8 @@ pub enum InputFormat {
     Stream,
     StreamBase64,
     StreamFramed,
+    #[value(alias = "stream-base64-separate", alias = "separate-base64")]
+    StreamSeparateBase64,
 }
 
 #[derive(Default, Clone, Copy, Debug, Eq, Hash, PartialEq, ValueEnum)]
@@ -112,6 +116,35 @@ macro_rules! run_x {
                                 Ok(_) => count += 1,
                                 Err(_) => continue 'variants,
                             }
+                        }
+                        count
+                    }
+                    InputFormat::StreamSeparateBase64 => {
+                        let tokens = util::SeparateBase64Tokens::new(&mut rr);
+                        let mut buffered_token = String::new();
+                        let mut count = 0;
+                        for token in tokens {
+                            let token = match token {
+                                Ok(t) => t,
+                                Err(_) => continue 'variants,
+                            };
+                            if buffered_token.is_empty() {
+                                buffered_token = token;
+                            } else {
+                                buffered_token.push_str(&token);
+                            }
+                            let mut cursor = std::io::Cursor::new(buffered_token.as_bytes());
+                            let mut l = crate::Limited::new(&mut cursor, crate::Limits::none());
+                            if crate::Type::read_xdr_base64_to_end(v, &mut l).is_ok() {
+                                count += 1;
+                                buffered_token.clear();
+                                if count >= self.certainty {
+                                    break;
+                                }
+                            }
+                        }
+                        if !buffered_token.is_empty() {
+                            continue 'variants;
                         }
                         count
                     }

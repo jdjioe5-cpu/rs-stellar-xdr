@@ -19,3 +19,6 @@ mod tx_read_edge_cases;
 mod tx_small;
 mod vecm;
 mod version;
+
+#[cfg(feature = "cli")]
+mod decode_stream_separate_base64;
