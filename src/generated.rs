@@ -121,7 +121,7 @@ use std::borrow::Cow;
 #[cfg(feature = "std")]
 use std::{
     error, io,
-    io::{BufRead, BufReader, Cursor, Read, Write},
+    io::{BufRead, Cursor, Read, Write},
 };
 
 /// Error contains all errors returned by functions in this crate. It can be
@@ -486,9 +486,71 @@ impl<W: Write> Write for Limited<W> {
     }
 }
 
+/// A lightweight reader wrapper that caches at most a single byte to support
+/// peeking for EOF without allocating an internal buffer.
+#[cfg(feature = "std")]
+#[derive(Debug)]
+pub struct PeekRead<R: Read> {
+    reader: R,
+    buf: Option<u8>,
+}
+
+#[cfg(feature = "std")]
+impl<R: Read> PeekRead<R> {
+    /// Creates a new `PeekRead` wrapping the given reader.
+    pub fn new(reader: R) -> Self {
+        Self { reader, buf: None }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<R: Read> Read for PeekRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if let Some(b) = self.buf.take() {
+            buf[0] = b;
+            return Ok(1);
+        }
+        self.reader.read(buf)
+    }
+}
+
+#[cfg(feature = "std")]
+impl<R: Read> BufRead for PeekRead<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.buf.is_none() {
+            let mut byte = [0u8; 1];
+            loop {
+                match self.reader.read(&mut byte) {
+                    Ok(0) => break,
+                    Ok(1) => {
+                        self.buf = Some(byte[0]);
+                        break;
+                    }
+                    Ok(_) => unreachable!(),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        match &self.buf {
+            Some(b) => Ok(core::slice::from_ref(b)),
+            None => Ok(&[]),
+        }
+    }
+
+    fn consume(&mut self, amt: usize) {
+        if amt > 0 {
+            self.buf = None;
+        }
+    }
+}
+
 #[cfg(feature = "std")]
 pub struct ReadXdrIter<R: Read, S: ReadXdr> {
-    reader: Limited<BufReader<R>>,
+    reader: Limited<PeekRead<R>>,
     _s: PhantomData<S>,
 }
 
@@ -497,7 +559,7 @@ impl<R: Read, S: ReadXdr> ReadXdrIter<R, S> {
     fn new(r: R, limits: Limits) -> Self {
         Self {
             reader: Limited {
-                inner: BufReader::new(r),
+                inner: PeekRead::new(r),
                 limits,
             },
             _s: PhantomData,
