@@ -10,6 +10,7 @@ mod serde_tx;
 mod serde_tx_schema;
 mod str;
 mod stringm;
+mod to_xdr_len;
 mod tx_auths;
 mod tx_base64_skip_whitespace;
 mod tx_debug_display;

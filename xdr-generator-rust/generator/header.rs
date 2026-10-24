@@ -683,6 +683,28 @@ pub trait WriteXdr {
         Ok(bytes)
     }
 
+    /// Calculate the serialized XDR byte length without allocating memory or performing I/O.
+    #[cfg(feature = "std")]
+    fn to_xdr_len(&self, limits: Limits) -> Result<usize, Error> {
+        struct LenWriter(usize);
+        impl Write for LenWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.saturating_add(buf.len());
+                Ok(buf.len())
+            }
+            fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+                self.0 = self.0.saturating_add(buf.len());
+                Ok(())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut w = Limited::new(LenWriter(0), limits);
+        self.write_xdr(&mut w)?;
+        Ok(w.inner.0)
+    }
+
     #[cfg(feature = "base64")]
     fn to_xdr_base64(&self, limits: Limits) -> Result<String, Error> {
         let mut enc = Limited::new(
