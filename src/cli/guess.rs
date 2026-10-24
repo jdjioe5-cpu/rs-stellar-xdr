@@ -1,9 +1,10 @@
 use clap::{Args, ValueEnum};
-use std::cmp;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, stdin, stdout, Cursor, Read, Write};
+use std::io::{stdin, stdout, Cursor, Read, Write};
 use std::path::Path;
+
+use crate::cli::util::ResetRead;
 
 #[derive(thiserror::Error, Debug)]
 #[allow(clippy::enum_variant_names)]
@@ -52,77 +53,87 @@ pub enum OutputFormat {
     List,
 }
 
-// TODO: Remove run_x macro, it exists only to reduce the diff from when curr/next
-// channels existed and each had their own run_curr/run_next invocation.
+/// Guess which XDR types can decode the input stream.
+pub fn guess_types<R: Read>(
+    rr: &mut ResetRead<R>,
+    format: InputFormat,
+    certainty: usize,
+) -> Vec<crate::TypeVariant> {
+    let mut guessed = Vec::new();
+    'variants: for v in crate::TypeVariant::VARIANTS {
+        rr.reset();
+        let count: usize = match format {
+            InputFormat::Single => {
+                let mut l = crate::Limited::new(&mut *rr, crate::Limits::none());
+                crate::Type::read_xdr_to_end(v, &mut l)
+                    .ok()
+                    .map(|_| 1)
+                    .unwrap_or_default()
+            }
+            InputFormat::SingleBase64 => {
+                let mut l = crate::Limited::new(&mut *rr, crate::Limits::none());
+                crate::Type::read_xdr_base64_to_end(v, &mut l)
+                    .ok()
+                    .map(|_| 1)
+                    .unwrap_or_default()
+            }
+            InputFormat::Stream => {
+                let mut l = crate::Limited::new(&mut *rr, crate::Limits::none());
+                let iter = crate::Type::read_xdr_iter(v, &mut l);
+                let iter = iter.take(certainty);
+                let mut count = 0;
+                for v in iter {
+                    match v {
+                        Ok(_) => count += 1,
+                        Err(_) => continue 'variants,
+                    }
+                }
+                count
+            }
+            InputFormat::StreamBase64 => {
+                let mut l = crate::Limited::new(&mut *rr, crate::Limits::none());
+                let iter = crate::Type::read_xdr_base64_iter(v, &mut l);
+                let iter = iter.take(certainty);
+                let mut count = 0;
+                for v in iter {
+                    match v {
+                        Ok(_) => count += 1,
+                        Err(_) => continue 'variants,
+                    }
+                }
+                count
+            }
+            InputFormat::StreamFramed => {
+                let mut l = crate::Limited::new(&mut *rr, crate::Limits::none());
+                let iter = crate::Type::read_xdr_framed_iter(v, &mut l);
+                let iter = iter.take(certainty);
+                let mut count = 0;
+                for v in iter {
+                    match v {
+                        Ok(_) => count += 1,
+                        Err(_) => continue 'variants,
+                    }
+                }
+                count
+            }
+        };
+        if count > 0 {
+            guessed.push(v);
+        }
+    }
+    guessed
+}
+
 macro_rules! run_x {
     ($f:ident) => {
         fn $f(&self) -> Result<(), Error> {
             let mut rr = ResetRead::new(self.input()?);
-            let mut guessed = false;
-            'variants: for v in crate::TypeVariant::VARIANTS {
-                rr.reset();
-                let count: usize = match self.input_format {
-                    InputFormat::Single => {
-                        let mut l = crate::Limited::new(&mut rr, crate::Limits::none());
-                        crate::Type::read_xdr_to_end(v, &mut l)
-                            .ok()
-                            .map(|_| 1)
-                            .unwrap_or_default()
-                    }
-                    InputFormat::SingleBase64 => {
-                        let mut l = crate::Limited::new(&mut rr, crate::Limits::none());
-                        crate::Type::read_xdr_base64_to_end(v, &mut l)
-                            .ok()
-                            .map(|_| 1)
-                            .unwrap_or_default()
-                    }
-                    InputFormat::Stream => {
-                        let mut l = crate::Limited::new(&mut rr, crate::Limits::none());
-                        let iter = crate::Type::read_xdr_iter(v, &mut l);
-                        let iter = iter.take(self.certainty);
-                        let mut count = 0;
-                        for v in iter {
-                            match v {
-                                Ok(_) => count += 1,
-                                Err(_) => continue 'variants,
-                            }
-                        }
-                        count
-                    }
-                    InputFormat::StreamBase64 => {
-                        let mut l = crate::Limited::new(&mut rr, crate::Limits::none());
-                        let iter = crate::Type::read_xdr_base64_iter(v, &mut l);
-                        let iter = iter.take(self.certainty);
-                        let mut count = 0;
-                        for v in iter {
-                            match v {
-                                Ok(_) => count += 1,
-                                Err(_) => continue 'variants,
-                            }
-                        }
-                        count
-                    }
-                    InputFormat::StreamFramed => {
-                        let mut l = crate::Limited::new(&mut rr, crate::Limits::none());
-                        let iter = crate::Type::read_xdr_framed_iter(v, &mut l);
-                        let iter = iter.take(self.certainty);
-                        let mut count = 0;
-                        for v in iter {
-                            match v {
-                                Ok(_) => count += 1,
-                                Err(_) => continue 'variants,
-                            }
-                        }
-                        count
-                    }
-                };
-                if count > 0 {
-                    writeln!(stdout(), "{}", v.name()).map_err(Error::WriteOutput)?;
-                    guessed = true;
-                }
-            }
-            if (!guessed) {
+            let guessed = guess_types(&mut rr, self.input_format, self.certainty);
+            if guessed.is_empty() {
                 std::process::exit(1);
+            }
+            for v in guessed {
+                writeln!(stdout(), "{}", v.name()).map_err(Error::WriteOutput)?;
             }
             Ok(())
         }
@@ -157,129 +168,5 @@ impl Cmd {
         } else {
             Ok(Box::new(stdin()))
         }
-    }
-}
-
-struct ResetRead<R: Read> {
-    read: R,
-    buf: Vec<u8>,
-    cursor: usize,
-}
-
-impl<R: Read> ResetRead<R> {
-    fn new(r: R) -> Self {
-        Self {
-            read: r,
-            buf: Vec::new(),
-            cursor: 0,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.cursor = 0;
-    }
-}
-
-impl<R: Read> Read for ResetRead<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // Read from the buffer first into buf.
-        let n = cmp::min(self.buf.len() - self.cursor, buf.len());
-        buf[..n].copy_from_slice(&self.buf[self.cursor..self.cursor + n]);
-        // Read from the reader and cache the result in the buf if the buf is consumed.
-        if n < buf.len() {
-            let read_n = self.read.read(&mut buf[n..])?;
-            self.buf.extend_from_slice(&buf[n..n + read_n]);
-            self.cursor += n + read_n;
-            Ok(n + read_n)
-        } else {
-            self.cursor += n;
-            Ok(n)
-        }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use std::{
-        error,
-        io::{Cursor, Read},
-    };
-
-    use super::ResetRead;
-
-    #[test]
-    fn test_reset_read() -> Result<(), Box<dyn error::Error>> {
-        let source: Vec<u8> = (0..8).collect();
-        let reader = Cursor::new(source);
-        let mut rr = ResetRead::new(reader);
-
-        let mut buf = [0u8; 4];
-        let n = rr.read(&mut buf)?;
-        assert_eq!(n, 4);
-        assert_eq!(buf, [0, 1, 2, 3]);
-
-        let mut buf = [0u8; 4];
-        let n = rr.read(&mut buf)?;
-        assert_eq!(n, 4);
-        assert_eq!(buf, [4, 5, 6, 7]);
-
-        let n = rr.read(&mut buf)?;
-        assert_eq!(n, 0);
-
-        rr.reset();
-        let mut buf = [0u8; 4];
-        let n = rr.read(&mut buf)?;
-        assert_eq!(n, 4);
-        assert_eq!(buf, [0, 1, 2, 3]);
-
-        Ok(())
-    }
-
-    // Test that a read after reset() works correctly when partially
-    // overlapping the cached buffer. Previously this panicked with
-    // "range end index 5 out of range for slice of length 4".
-    #[test]
-    fn test_reset_read_partial_cache_overlap() -> Result<(), Box<dyn error::Error>> {
-        // 12 bytes with distinct values to verify read ordering.
-        let source: Vec<u8> = vec![
-            0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-        ];
-        let reader = Cursor::new(source);
-        let mut rr = ResetRead::new(reader);
-
-        // Read 5 bytes to populate cache
-        let mut buf5 = [0u8; 5];
-        let n = rr.read(&mut buf5)?;
-        assert_eq!(n, 5);
-        assert_eq!(buf5, [0x00, 0x00, 0x00, 0x00, 0x01]);
-
-        // Reset cursor to replay from start
-        rr.reset();
-
-        // Read 4 bytes entirely from cache
-        let mut buf4 = [0u8; 4];
-        let n = rr.read(&mut buf4)?;
-        assert_eq!(n, 4);
-        assert_eq!(buf4, [0x00, 0x00, 0x00, 0x00]);
-
-        // Read 4 bytes: 1 from cache, 3 from the underlying reader.
-        let mut buf4 = [0u8; 4];
-        let n = rr.read(&mut buf4)?;
-        assert_eq!(n, 4);
-        assert_eq!(buf4, [0x01, 0x02, 0x03, 0x04]);
-
-        // Read remaining 3 bytes
-        let mut buf3 = [0u8; 3];
-        let n = rr.read(&mut buf3)?;
-        assert_eq!(n, 3);
-        assert_eq!(buf3, [0x05, 0x06, 0x07]);
-
-        // Read last byte
-        let mut buf1 = [0u8; 1];
-        let n = rr.read(&mut buf1)?;
-        assert_eq!(n, 1);
-        assert_eq!(buf1, [0x08]);
-
-        Ok(())
     }
 }
